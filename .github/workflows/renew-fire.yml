@@ -3,7 +3,7 @@ name: 🚀 续一次火
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 0,2,4 * * *"
+    - cron: "0 12,14,16 * * *"
       timezone: "Asia/Shanghai"
 
 permissions:
