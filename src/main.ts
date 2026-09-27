@@ -1,6 +1,6 @@
 import 'dotenv/config'
 import { chromium, type Browser, type Cookie, type Locator, type Page } from 'playwright'
-import { mkdir, readFile } from 'node:fs/promises'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { createInterface } from 'node:readline/promises'
 import { stdin as input, stdout as output } from 'node:process'
 import dayjs from 'dayjs'
@@ -28,6 +28,18 @@ const SEARCH_RESULT_TIMEOUT = 5000
 const SEARCH_RETRY_LIMIT = 3
 const SEARCH_RETRY_INTERVAL = 2000
 const SEARCH_INPUT_RESET_DELAY = 500
+const PAGE_STATE_POLL_INTERVAL = 500
+const SEND_CONFIRM_TIMEOUT = 15000
+const SEND_CONFIRM_POLL_INTERVAL = 250
+const SEND_CONFIRM_STABILITY_DELAY = 3000
+const EDITOR_INPUT_TIMEOUT = 3000
+
+const LOGIN_OR_RISK_TEXT_PATTERN =
+  /^(一键登录|登录|请登录|重新登录|扫码登录|手机号登录|安全验证|验证|风险提示)$/
+const SEND_FAILURE_TEXT_PATTERN = /^(发送失败|消息发送失败)$/
+const SEND_RETRY_BUTTON_PATTERN = /^(重新发送|重试)$/
+const LOGIN_OR_RISK_SURFACE_SELECTOR =
+  'form, [role="dialog"], [class*="login" i], [class*="passport" i], [class*="verify" i], [class*="captcha" i], [class*="risk" i]'
 
 const MESSAGE_TEMPLATE_PLACEHOLDER_PATTERN = /\{\{\s*([a-zA-Z]+)\s*\}\}/g
 const MESSAGE_TEMPLATE_PLACEHOLDERS = [
@@ -47,6 +59,13 @@ interface DouyinAccount {
   cookies: Cookie[]
   targetNames: string[]
   messageTemplate: string | undefined
+}
+
+class ManualInterventionRequiredError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'ManualInterventionRequiredError'
+  }
 }
 
 /**
@@ -117,96 +136,385 @@ async function runDouyinAccount(
 ): Promise<void> {
   const context = await browser.newContext()
   let page: Page | undefined
+  let currentStep = '创建浏览器上下文'
 
   try {
-    console.log(`开始执行账号：${account.name}`)
+    logStep(account.name, undefined, currentStep)
     await context.addCookies(account.cookies)
 
+    currentStep = '打开抖音聊天页'
     page = await context.newPage()
     await page.goto('https://www.douyin.com/chat', {
       waitUntil: 'domcontentloaded',
     })
+    logStep(account.name, undefined, `${currentStep}完成`, `页面=${safePageLocation(page)}`)
 
     const searchInput = page.locator('input.semi-input[placeholder="搜索"]').first()
-    const searchVisible = await searchInput
-      .waitFor({ state: 'visible', timeout: CHAT_PAGE_READY_TIMEOUT })
-      .then(() => true)
-      .catch(() => false)
+    currentStep = '检查登录状态和聊天页'
+    await assertAuthenticatedChatPage(page, searchInput, account.name)
 
-    if (!searchVisible) {
-      throw new Error('聊天页搜索框未出现，Cookie 可能已经失效')
-    }
-
+    currentStep = '等待会话列表加载'
     await waitForChatListReady(page, account.name)
 
     // 记录未命中的会话，等其余好友都发完再统一报错，避免一个人改名连累当天所有人。
-    const missingNames: string[] = []
+    const targetFailures: Error[] = []
     const needsYiyan =
       account.messageTemplate === undefined ||
       /\{\{\s*(yiyan|from)\s*\}\}/.test(account.messageTemplate)
 
-    for (const targetName of account.targetNames) {
-      console.log(`[${account.name}] 开始搜索会话：${targetName}`)
+    for (const [targetIndex, targetName] of account.targetNames.entries()) {
+      currentStep = '搜索联系人'
+      logStep(account.name, targetName, currentStep)
 
-      const searchResult = await searchConversation(page, searchInput, account.name, targetName)
+      try {
+        const searchResult = await searchConversation(page, searchInput, account.name, targetName)
 
-      if (!searchResult) {
-        await captureFailureScreenshot(page, `${account.name}-${targetName}-search`)
-        console.log(`[${account.name}] 找不到搜索结果，已跳过：${targetName}`)
-        missingNames.push(targetName)
-        continue
-      }
+        if (!searchResult) {
+          const error = new Error('好友不存在或搜索结果未加载，连续搜索重试仍未找到')
+          console.error(`[${account.name}] 联系人处理失败：${targetName}；原因=${error.message}`)
+          targetFailures.push(new Error(`[${targetName}] ${error.message}`, { cause: error }))
+          await captureFailureDiagnostics(page, account, targetName, currentStep)
+          continue
+        }
 
-      await searchResult.getByText(/^(发消息|发私信)$/).click({ timeout: 5000 })
-      console.log(`[${account.name}] 已打开私信：${targetName}`)
-
-      const editorInput = page
-        .locator(
-          '.messageEditorimChatEditorContainer [data-slate-editor="true"][contenteditable="true"]',
-        )
-        .first()
-      await editorInput.waitFor({ state: 'visible', timeout: 10000 })
-      await editorInput.click()
-
-      let message: string
-
-      if (account.messageTemplate !== undefined) {
-        message = renderMessageTemplate(
-          account.messageTemplate,
+        currentStep = '打开联系人私信'
+        await assertPageDoesNotRequireIntervention(page, account.name)
+        const openMessageButton = searchResult.getByText(/^(发消息|发私信)$/)
+        logStep(
           account.name,
           targetName,
-          needsYiyan ? pickRandomYiyan(yiyans) : undefined,
+          currentStep,
+          `搜索结果数=${await page.locator('.SearchPanelitembox').count()}；发消息控件数=${await openMessageButton.count()}`,
         )
-      } else {
-        const yiyan = pickRandomYiyan(yiyans)
-        message = includeYiyanSource ? `${yiyan.hitokoto}\n——「${yiyan.from}」` : yiyan.hitokoto
+        await openMessageButton.click({ timeout: 5000 })
+        logStep(account.name, targetName, '已点击发消息控件')
+
+        currentStep = '确认私信页和编辑框'
+        const editorInput = page
+          .locator(
+            '.messageEditorimChatEditorContainer [data-slate-editor="true"][contenteditable="true"]',
+          )
+          .first()
+        await editorInput.waitFor({ state: 'visible', timeout: 10000 })
+        await assertPageDoesNotRequireIntervention(page, account.name)
+        await editorInput.click()
+        logStep(account.name, targetName, `${currentStep}完成`)
+
+        let message: string
+
+        if (account.messageTemplate !== undefined) {
+          message = renderMessageTemplate(
+            account.messageTemplate,
+            account.name,
+            targetName,
+            needsYiyan ? pickRandomYiyan(yiyans) : undefined,
+          )
+        } else {
+          const yiyan = pickRandomYiyan(yiyans)
+          message = includeYiyanSource ? `${yiyan.hitokoto}\n——「${yiyan.from}」` : yiyan.hitokoto
+        }
+
+        const matchingMessages = page.getByText(message, { exact: true })
+        const matchingMessageCountBeforeSend = await matchingMessages.count()
+
+        currentStep = '输入并发送消息'
+        logStep(account.name, targetName, currentStep, '开始输入消息（消息正文不写入日志）')
+        await page.keyboard.insertText(message)
+        const editorContainsMessage = await waitForEditorToMatchMessage(page, editorInput, message)
+
+        if (!editorContainsMessage) {
+          throw new Error('输入确认失败：编辑框内容与待发送消息不一致，已阻止按 Enter 发送')
+        }
+
+        await assertPageDoesNotRequireIntervention(page, account.name)
+        await page.keyboard.press('Enter')
+
+        currentStep = '等待页面确认消息发送'
+        const sendConfirmed = await waitForMessageSendConfirmation(
+          page,
+          editorInput,
+          matchingMessages,
+          matchingMessageCountBeforeSend,
+          account.name,
+          targetName,
+        )
+
+        if (!sendConfirmed) {
+          throw new Error('发送确认失败：页面未确认消息已经成功发送')
+        }
+
+        logStep(account.name, targetName, '已确认发送消息')
+      } catch (error) {
+        const targetError = toError(error)
+        targetFailures.push(new Error(`[${targetName}] ${targetError.message}`, { cause: targetError }))
+        console.error(
+          `[${account.name}] 联系人处理失败：${targetName}；步骤=${currentStep}；原因=${targetError.message}`,
+        )
+        await captureFailureDiagnostics(page, account, targetName, currentStep)
+
+        if (targetError instanceof ManualInterventionRequiredError) {
+          console.error(`[${account.name}] 需要人工检查登录或安全验证；停止处理后续联系人。`)
+          break
+        }
+
+        if (targetIndex < account.targetNames.length - 1) {
+          try {
+            currentStep = '恢复聊天页以继续下一个联系人'
+            logStep(account.name, targetName, currentStep)
+            await page.goto('https://www.douyin.com/chat', { waitUntil: 'domcontentloaded' })
+            await assertAuthenticatedChatPage(page, searchInput, account.name)
+            await waitForChatListReady(page, account.name)
+          } catch (recoveryError) {
+            const errorDuringRecovery = toError(recoveryError)
+            targetFailures.push(
+              new Error(`页面恢复失败，无法继续后续联系人：${errorDuringRecovery.message}`, {
+                cause: errorDuringRecovery,
+              }),
+            )
+            console.error(`[${account.name}] ${errorDuringRecovery.message}`)
+            await captureFailureDiagnostics(page, account, targetName, currentStep)
+            break
+          }
+        }
       }
-
-      await page.keyboard.insertText(message)
-      await page.keyboard.press('Enter')
-      console.log(`[${account.name}] 已发送消息：${targetName}`)
-      await page.waitForTimeout(1000)
     }
 
-    await page.waitForTimeout(5000)
-
-    if (missingNames.length > 0) {
-      throw new Error(
-        `以下会话未找到，火花可能已经中断：${missingNames.join('、')}。` +
-          `好友改昵称是最常见的原因，建议在抖音中为好友设置备注名，` +
-          `并把备注名填入账号的 targetNames，这样好友再改昵称也不会影响续火。`,
-      )
+    if (targetFailures.length > 0) {
+      throw new AggregateError(targetFailures, `${targetFailures.length} 个联系人处理失败`)
     }
 
-    console.log(`账号执行完成：${account.name}`)
+    logStep(account.name, undefined, '账号执行完成')
   } catch (error) {
-    await captureFailureScreenshot(page, account.name)
+    console.error(`[${account.name}] 执行中止；步骤=${currentStep}；页面=${page ? safePageLocation(page) : '尚未打开'}`)
+    await captureFailureDiagnostics(page, account, undefined, currentStep)
     throw error
   } finally {
     if (autoClose) {
       await context.close()
     }
   }
+}
+
+function logStep(
+  accountName: string,
+  targetName: string | undefined,
+  step: string,
+  details = '',
+): void {
+  const target = targetName ? `；联系人=${targetName}` : ''
+  const extra = details ? `；${details}` : ''
+  console.log(`[${accountName}] 步骤=${step}${target}${extra}`)
+}
+
+function safePageLocation(page: Page): string {
+  try {
+    const { host, pathname } = new URL(page.url())
+    return `${host}${pathname}`
+  } catch {
+    return '<地址不可用>'
+  }
+}
+
+async function assertPageDoesNotRequireIntervention(
+  page: Page,
+  accountName: string,
+): Promise<void> {
+  const abnormalState = await detectLoginOrRiskState(page)
+
+  if (abnormalState) {
+    console.error(`[${accountName}] 检测到抖音登录异常或风控状态，停止执行。`)
+    throw new ManualInterventionRequiredError(
+      `检测到抖音登录异常或风控状态，停止执行（${abnormalState}）`,
+    )
+  }
+}
+
+/**
+ * 等待聊天页进入已登录状态；检测到登录页或风控提示时立即停止。
+ *
+ * 此函数只读取页面状态，不点击登录、验证或风控相关控件。
+ */
+async function assertAuthenticatedChatPage(
+  page: Page,
+  searchInput: Locator,
+  accountName: string,
+): Promise<void> {
+  const deadline = Date.now() + CHAT_PAGE_READY_TIMEOUT
+
+  while (Date.now() < deadline) {
+    const searchVisible = await searchInput.isVisible().catch(() => false)
+    const abnormalState = await detectLoginOrRiskState(page, searchVisible)
+
+    if (abnormalState) {
+      console.error(`[${accountName}] 检测到抖音登录异常或风控状态，停止执行。`)
+      throw new ManualInterventionRequiredError(
+        `检测到抖音登录异常或风控状态，停止执行（${abnormalState}）`,
+      )
+    }
+
+    if (searchVisible) {
+      return
+    }
+
+    await page.waitForTimeout(PAGE_STATE_POLL_INTERVAL)
+  }
+
+  const abnormalState = await detectLoginOrRiskState(page)
+
+  if (abnormalState) {
+    console.error(`[${accountName}] 检测到抖音登录异常或风控状态，停止执行。`)
+    throw new ManualInterventionRequiredError(
+      `检测到抖音登录异常或风控状态，停止执行（${abnormalState}）`,
+    )
+  }
+
+  throw new Error('聊天页搜索框未出现，登录状态可能已失效或页面处于异常状态')
+}
+
+/**
+ * 检测登录、验证或风控页面。只返回简短分类，不记录页面内容或 URL 参数。
+ */
+async function detectLoginOrRiskState(
+  page: Page,
+  searchVisible = false,
+): Promise<string | undefined> {
+  const currentUrl = page.url()
+
+  try {
+    const parsedUrl = new URL(currentUrl)
+
+    if (
+      parsedUrl.hostname === 'passport.douyin.com' ||
+      /\/(login|passport|verify|captcha|risk)(\/|$)/i.test(parsedUrl.pathname)
+    ) {
+      return '页面已进入登录或安全验证流程'
+    }
+  } catch {
+    return '页面地址异常'
+  }
+
+  const candidates = await (searchVisible
+    ? page.locator(LOGIN_OR_RISK_SURFACE_SELECTOR)
+    : page
+  )
+    .getByText(LOGIN_OR_RISK_TEXT_PATTERN, { exact: true })
+    .all()
+
+  for (const candidate of candidates) {
+    if (await candidate.isVisible().catch(() => false)) {
+      const text = (await candidate.innerText().catch(() => '')).trim()
+      return text ? `页面出现“${text}”提示` : '页面出现登录或安全验证提示'
+    }
+  }
+
+  return undefined
+}
+
+/**
+ * 同时确认编辑框已清空，且消息文本作为新的可见 DOM 节点稳定出现在聊天区域。
+ */
+async function waitForMessageSendConfirmation(
+  page: Page,
+  editorInput: Locator,
+  matchingMessages: Locator,
+  matchingMessageCountBeforeSend: number,
+  accountName: string,
+  targetName: string,
+): Promise<boolean> {
+  const deadline = Date.now() + SEND_CONFIRM_TIMEOUT
+  let confirmationStartedAt: number | undefined
+  let lastDiagnosticAt = 0
+
+  while (Date.now() < deadline) {
+    const editorText = await editorInput.textContent().catch(() => undefined)
+    const editorIsEmpty = typeof editorText === 'string' && editorText.trim().length === 0
+    const matchingMessageCount = await matchingMessages.count().catch(() => 0)
+    const newMessageIsVisible =
+      matchingMessageCount > matchingMessageCountBeforeSend &&
+      (await matchingMessages.last().isVisible().catch(() => false))
+    const sendFailureVisible = await hasVisibleSendFailureState(page)
+    const now = Date.now()
+
+    if (now - lastDiagnosticAt >= 2000) {
+      logStep(
+        accountName,
+        targetName,
+        '检查发送状态',
+        `编辑框已清空=${editorIsEmpty}；消息文本节点数=${matchingMessageCount}（发送前=${matchingMessageCountBeforeSend}）；页面显示失败提示=${sendFailureVisible}`,
+      )
+      lastDiagnosticAt = now
+    }
+
+    if (editorIsEmpty && newMessageIsVisible && !sendFailureVisible) {
+      confirmationStartedAt ??= now
+
+      if (now - confirmationStartedAt >= SEND_CONFIRM_STABILITY_DELAY) {
+        return true
+      }
+    } else {
+      confirmationStartedAt = undefined
+    }
+
+    await page.waitForTimeout(SEND_CONFIRM_POLL_INTERVAL)
+  }
+
+  logStep(accountName, targetName, '发送确认超时', `等待上限=${SEND_CONFIRM_TIMEOUT}ms`)
+  return false
+}
+
+async function waitForEditorToMatchMessage(
+  page: Page,
+  editorInput: Locator,
+  message: string,
+): Promise<boolean> {
+  const deadline = Date.now() + EDITOR_INPUT_TIMEOUT
+  const expectedText = normalizeComparableText(message)
+
+  while (Date.now() < deadline) {
+    const actualText = await editorInput.textContent().catch(() => undefined)
+
+    if (typeof actualText === 'string' && normalizeComparableText(actualText) === expectedText) {
+      return true
+    }
+
+    await page.waitForTimeout(100)
+  }
+
+  return false
+}
+
+function normalizeComparableText(value: string): string {
+  return value.replace(/\s+/g, ' ').trim()
+}
+
+async function hasVisibleText(page: Page, pattern: RegExp): Promise<boolean> {
+  const candidates = await page.getByText(pattern, { exact: true }).all()
+
+  for (const candidate of candidates) {
+    if (await candidate.isVisible().catch(() => false)) {
+      return true
+    }
+  }
+
+  return false
+}
+
+async function hasVisibleSendFailureState(page: Page): Promise<boolean> {
+  if (await hasVisibleText(page, SEND_FAILURE_TEXT_PATTERN)) {
+    return true
+  }
+
+  const retryButtons = await page
+    .getByRole('button', { name: SEND_RETRY_BUTTON_PATTERN, exact: true })
+    .all()
+
+  for (const retryButton of retryButtons) {
+    if (await retryButton.isVisible().catch(() => false)) {
+      return true
+    }
+  }
+
+  return false
 }
 
 /**
@@ -220,19 +528,30 @@ async function runDouyinAccount(
  * @returns 等待结束后的 Promise，超时也不抛错，交给后续搜索重试兜底。
  */
 async function waitForChatListReady(page: Page, accountName: string): Promise<void> {
-  const conversationListReady = await page
-    .locator('[class*="conversation"], [class*="Conversation"]')
-    .first()
-    .waitFor({ state: 'visible', timeout: CHAT_PAGE_READY_TIMEOUT })
-    .then(() => true)
-    .catch(() => false)
+  const conversationList = page.locator('[class*="conversation"], [class*="Conversation"]')
+  let conversationListReady = true
+
+  try {
+    await conversationList.first().waitFor({ state: 'visible', timeout: CHAT_PAGE_READY_TIMEOUT })
+  } catch (error) {
+    conversationListReady = false
+    console.warn(
+      `[${accountName}] 会话列表等待超时：${toError(error).message}；匹配节点数=${await conversationList.count()}`,
+    )
+  }
 
   if (!conversationListReady) {
     console.log(`[${accountName}] 会话列表未在预期时间内出现，将依赖搜索重试兜底`)
   }
 
   // 会话列表的头像与最近消息还会继续拉取，等网络安静下来搜索命中率更高。
-  await page.waitForLoadState('networkidle', { timeout: CHAT_PAGE_IDLE_TIMEOUT }).catch(() => {})
+  try {
+    await page.waitForLoadState('networkidle', { timeout: CHAT_PAGE_IDLE_TIMEOUT })
+  } catch (error) {
+    console.warn(
+      `[${accountName}] 页面在 ${CHAT_PAGE_IDLE_TIMEOUT}ms 内未达到 networkidle，继续使用 DOM 状态检查：${toError(error).message}`,
+    )
+  }
 }
 
 /**
@@ -262,18 +581,29 @@ async function searchConversation(
   for (let attempt = 1; attempt <= SEARCH_RETRY_LIMIT; attempt += 1) {
     await searchInput.fill('')
     // 等旧的结果面板收起，否则会读到上一个好友残留的列表项。
-    await page
-      .locator('.SearchPanelitembox')
-      .first()
-      .waitFor({ state: 'hidden', timeout: SEARCH_RESULT_TIMEOUT })
-      .catch(() => {})
+    try {
+      await page
+        .locator('.SearchPanelitembox')
+        .first()
+        .waitFor({ state: 'hidden', timeout: SEARCH_RESULT_TIMEOUT })
+    } catch (error) {
+      console.warn(
+        `[${accountName}] 第 ${attempt} 次搜索时旧结果面板未按时收起：${toError(error).message}`,
+      )
+    }
     await page.waitForTimeout(SEARCH_INPUT_RESET_DELAY)
     await searchInput.fill(targetName)
 
-    const searchResultVisible = await searchResult
-      .waitFor({ state: 'visible', timeout: SEARCH_RESULT_TIMEOUT })
-      .then(() => true)
-      .catch(() => false)
+    let searchResultVisible = true
+
+    try {
+      await searchResult.waitFor({ state: 'visible', timeout: SEARCH_RESULT_TIMEOUT })
+    } catch (error) {
+      searchResultVisible = false
+      console.warn(
+        `[${accountName}] 第 ${attempt}/${SEARCH_RETRY_LIMIT} 次搜索未命中联系人“${targetName}”：${toError(error).message}；结果容器数=${await page.locator('.SearchPanelitembox').count()}`,
+      )
+    }
 
     if (searchResultVisible) {
       return searchResult
@@ -303,15 +633,102 @@ async function captureFailureScreenshot(
 
   try {
     await mkdir(FAILURE_SCREENSHOT_DIRECTORY, { recursive: true })
-    const screenshotPath = `${FAILURE_SCREENSHOT_DIRECTORY}/failure-screenshot-${toSafeFileName(accountName)}.png`
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const screenshotPath = `${FAILURE_SCREENSHOT_DIRECTORY}/failure-screenshot-${toSafeFileName(accountName)}-${timestamp}.png`
     await page.screenshot({
       path: screenshotPath,
-      fullPage: true,
+      // 仅保存当前视口，避免把完整聊天历史写入诊断截图。
+      fullPage: false,
     })
     console.log(`已保存失败截图：${screenshotPath}`)
   } catch (error) {
     console.error('保存失败截图失败:', error)
   }
+}
+
+async function captureFailureDiagnostics(
+  page: Page | undefined,
+  account: DouyinAccount,
+  targetName: string | undefined,
+  step: string,
+): Promise<void> {
+  if (!page || page.isClosed()) {
+    return
+  }
+
+  const label = `${account.name}-${targetName ?? 'account'}-${step}`
+  await captureFailureScreenshot(page, label)
+
+  try {
+    const summary = await page.evaluate(() => {
+      const selector =
+        'button, [role="button"], [role="alert"], [role="dialog"], input, textarea, [contenteditable="true"]'
+      const visibleControls = Array.from(document.querySelectorAll<HTMLElement>(selector))
+        .filter((element) => {
+          const rect = element.getBoundingClientRect()
+          const style = window.getComputedStyle(element)
+          return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none'
+        })
+        .slice(0, 80)
+        .map((element) => ({
+          tag: element.tagName.toLowerCase(),
+          role: element.getAttribute('role'),
+          id: element.id || undefined,
+          className: typeof element.className === 'string' ? element.className.slice(0, 160) : undefined,
+          ariaLabel: element.getAttribute('aria-label'),
+          placeholder: element.getAttribute('placeholder'),
+          title: element.getAttribute('title'),
+          inputType: element.getAttribute('type'),
+          disabled: 'disabled' in element ? Boolean((element as HTMLInputElement).disabled) : undefined,
+        }))
+
+      return {
+        page: `${window.location.host}${window.location.pathname}`,
+        readyState: document.readyState,
+        viewport: { width: window.innerWidth, height: window.innerHeight },
+        counts: {
+          searchInput: document.querySelectorAll('input.semi-input[placeholder="搜索"]').length,
+          searchResult: document.querySelectorAll('.SearchPanelitembox').length,
+          messageEditor: document.querySelectorAll(
+            '.messageEditorimChatEditorContainer [data-slate-editor="true"][contenteditable="true"]',
+          ).length,
+        },
+        visibleControls,
+      }
+    })
+
+    const redactedSummary = redactDiagnosticSummary(summary, [account.name, ...account.targetNames])
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const dumpPath = `${FAILURE_SCREENSHOT_DIRECTORY}/failure-ui-${toSafeFileName(label)}-${timestamp}.json`
+    const serializedSummary = JSON.stringify(redactedSummary)
+
+    await writeFile(dumpPath, `${JSON.stringify(redactedSummary, null, 2)}\n`, 'utf8')
+    console.error(`[${account.name}] 失败页面结构摘要（不含输入框值、消息正文或 Cookie）：${serializedSummary}`)
+    console.error(`[${account.name}] 已保存页面结构摘要：${dumpPath}`)
+  } catch (error) {
+    console.error(`[${account.name}] 页面结构摘要采集失败：${toError(error).message}`)
+  }
+}
+
+function redactDiagnosticSummary<T>(value: T, namesToRedact: string[]): T {
+  if (typeof value === 'string') {
+    return namesToRedact.reduce(
+      (text, name) => (name ? text.split(name).join('<联系人>') : text),
+      value,
+    ) as T
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => redactDiagnosticSummary(item, namesToRedact)) as T
+  }
+
+  if (typeof value === 'object' && value !== null) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, child]) => [key, redactDiagnosticSummary(child, namesToRedact)]),
+    ) as T
+  }
+
+  return value
 }
 
 function toSafeFileName(value: string): string {
