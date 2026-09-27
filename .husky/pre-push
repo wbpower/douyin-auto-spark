@@ -1,1 +1,3 @@
-corepack pnpm check
+corepack pnpm run type-check
+corepack pnpm run lint:check
+corepack pnpm run format:check
