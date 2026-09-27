@@ -35,7 +35,7 @@ const SEND_CONFIRM_STABILITY_DELAY = 3000
 const EDITOR_INPUT_TIMEOUT = 3000
 
 const LOGIN_OR_RISK_TEXT_PATTERN =
-  /^(一键登录|登录|请登录|重新登录|扫码登录|手机号登录|安全验证|验证|风险提示)$/
+  /^(一键登录|登录|请登录|重新登录|扫码登录|手机号登录|安全验证|验证码|人机验证|验证|风险提示|风控)$/
 const SEND_FAILURE_TEXT_PATTERN = /^(发送失败|消息发送失败)$/
 const SEND_RETRY_BUTTON_PATTERN = /^(重新发送|重试)$/
 const LOGIN_OR_RISK_SURFACE_SELECTOR =
@@ -213,7 +213,14 @@ async function runDouyinAccount(
           message = includeYiyanSource ? `${yiyan.hitokoto}\n——「${yiyan.from}」` : yiyan.hitokoto
         }
 
-        const matchingMessages = page.getByText(message, { exact: true })
+        // 排除编辑器本身和所有后代；这些节点仅用于诊断，尚未证实为消息气泡。
+        const matchingMessages = page
+          .getByText(message, { exact: true })
+          .and(
+            page.locator(
+              '*:not(.messageEditorimChatEditorContainer):not(.messageEditorimChatEditorContainer *):not([data-slate-editor="true"]):not([data-slate-editor="true"] *):not([contenteditable="true"]):not([contenteditable="true"] *):not(:has(.messageEditorimChatEditorContainer, [data-slate-editor="true"], [contenteditable="true"]))',
+            ),
+          )
         const matchingMessageCountBeforeSend = await matchingMessages.count()
 
         currentStep = '输入并发送消息'
@@ -227,10 +234,30 @@ async function runDouyinAccount(
           throw new Error('输入确认失败：编辑框内容与待发送消息不一致，已阻止按 Enter 发送')
         }
 
-        await assertPageDoesNotRequireIntervention(page, account.name)
+        const beforeEnter = await logEditorSendState(
+          page,
+          editorInput,
+          message,
+          account.name,
+          targetName,
+          'Enter 前',
+        )
         await page.keyboard.press('Enter')
+        const enterPressedAt = Date.now()
 
         currentStep = '等待页面确认消息发送'
+        for (const offset of [100, 500, 1500]) {
+          await page.waitForTimeout(Math.max(0, offset - (Date.now() - enterPressedAt)))
+          await logEditorSendState(
+            page,
+            editorInput,
+            message,
+            account.name,
+            targetName,
+            `Enter 后 ${offset}ms`,
+            beforeEnter,
+          )
+        }
         const sendConfirmed = await waitForMessageSendConfirmation(
           page,
           editorInput,
@@ -413,7 +440,7 @@ async function detectLoginOrRiskState(
 }
 
 /**
- * 同时确认编辑框已清空，且消息文本作为新的可见 DOM 节点稳定出现在聊天区域。
+ * 监测编辑框和非编辑器文本候选。未获得真实消息容器证据时不宣称发送成功。
  */
 async function waitForMessageSendConfirmation(
   page: Page,
@@ -426,10 +453,15 @@ async function waitForMessageSendConfirmation(
   const deadline = Date.now() + SEND_CONFIRM_TIMEOUT
   let confirmationStartedAt: number | undefined
   let lastDiagnosticAt = 0
+  let unverifiedContainerLogged = false
 
   while (Date.now() < deadline) {
-    const editorText = await editorInput.textContent().catch(() => undefined)
-    const editorIsEmpty = typeof editorText === 'string' && editorText.trim().length === 0
+    await assertPageDoesNotRequireIntervention(page, accountName)
+    const editorState = await readEditorSendState(editorInput)
+    const editorIsEmpty =
+      editorState !== undefined &&
+      editorState.textContentLength === 0 &&
+      editorState.innerTextLength === 0
     const matchingMessageCount = await matchingMessages.count().catch(() => 0)
     const newMessageIsVisible =
       matchingMessageCount > matchingMessageCountBeforeSend &&
@@ -445,7 +477,7 @@ async function waitForMessageSendConfirmation(
         accountName,
         targetName,
         '检查发送状态',
-        `编辑框已清空=${editorIsEmpty}；消息文本节点数=${matchingMessageCount}（发送前=${matchingMessageCountBeforeSend}）；页面显示失败提示=${sendFailureVisible}`,
+        `编辑框已清空=${editorIsEmpty}；非编辑器候选节点数=${matchingMessageCount}（发送前=${matchingMessageCountBeforeSend}）；消息容器已验证=false；页面显示失败提示=${sendFailureVisible}`,
       )
       lastDiagnosticAt = now
     }
@@ -453,8 +485,16 @@ async function waitForMessageSendConfirmation(
     if (editorIsEmpty && newMessageIsVisible && !sendFailureVisible) {
       confirmationStartedAt ??= now
 
-      if (now - confirmationStartedAt >= SEND_CONFIRM_STABILITY_DELAY) {
-        return true
+      if (
+        now - confirmationStartedAt >= SEND_CONFIRM_STABILITY_DELAY &&
+        !unverifiedContainerLogged
+      ) {
+        logStep(
+          accountName,
+          targetName,
+          '候选文本稳定出现，但真实消息容器尚未验证，无法确认发送成功',
+        )
+        unverifiedContainerLogged = true
       }
     } else {
       confirmationStartedAt = undefined
@@ -465,6 +505,121 @@ async function waitForMessageSendConfirmation(
 
   logStep(accountName, targetName, '发送确认超时', `等待上限=${SEND_CONFIRM_TIMEOUT}ms`)
   return false
+}
+
+interface EditorSendState {
+  textContentLength: number
+  innerTextLength: number
+  textMatchesExpected: boolean
+  focused: boolean
+  visible: boolean
+  contentEditable: string | null
+  slateEditor: string | null
+  childElementCount: number
+  brCount: number
+  pCount: number
+  divCount: number
+  lineBreakCount: number
+}
+
+async function readEditorSendState(
+  editorInput: Locator,
+  expectedMessage?: string,
+): Promise<EditorSendState | undefined> {
+  const snapshot = await editorInput
+    .evaluate(
+      (element: HTMLElement) => ({
+        textContent: element.textContent ?? '',
+        innerText: element.innerText,
+        focused:
+          element === element.ownerDocument.activeElement ||
+          element.contains(element.ownerDocument.activeElement),
+        contentEditable: element.getAttribute('contenteditable'),
+        slateEditor: element.getAttribute('data-slate-editor'),
+        childElementCount: element.childElementCount,
+        brCount: element.querySelectorAll('br').length,
+        pCount: element.querySelectorAll('p').length,
+        divCount: element.querySelectorAll('div').length,
+      }),
+      undefined,
+      { timeout: 1000 },
+    )
+    .catch(() => undefined)
+
+  if (!snapshot) return undefined
+
+  const { textContent, innerText, ...structure } = snapshot
+  const normalizedTextContent = normalizeComparableText(textContent)
+  const normalizedInnerText = normalizeComparableText(innerText)
+  const expected =
+    expectedMessage === undefined ? undefined : normalizeComparableText(expectedMessage)
+  return {
+    ...structure,
+    visible: await editorInput.isVisible().catch(() => false),
+    textContentLength: normalizedTextContent.length,
+    innerTextLength: normalizedInnerText.length,
+    textMatchesExpected:
+      expected !== undefined &&
+      (normalizedTextContent === expected || normalizedInnerText === expected),
+    lineBreakCount: Math.max(
+      (textContent.match(/\r\n|\r|\n/g) ?? []).length,
+      (innerText.match(/\r\n|\r|\n/g) ?? []).length,
+    ),
+  }
+}
+
+async function logEditorSendState(
+  page: Page,
+  editorInput: Locator,
+  message: string,
+  accountName: string,
+  targetName: string,
+  phase: string,
+  beforeEnter?: EditorSendState,
+): Promise<EditorSendState | undefined> {
+  const abnormalState = await detectLoginOrRiskState(page)
+  if (abnormalState) {
+    logStep(
+      accountName,
+      targetName,
+      phase,
+      JSON.stringify({
+        page: safePageLocation(page),
+        interventionRequired: true,
+      }),
+    )
+    throw new ManualInterventionRequiredError(
+      `检测到抖音登录异常或风控状态，停止执行（${abnormalState}）`,
+    )
+  }
+  const state = await readEditorSendState(editorInput, message)
+  const sendFailureVisible = await hasVisibleSendFailureState(page)
+  logStep(
+    accountName,
+    targetName,
+    phase,
+    JSON.stringify({
+      page: safePageLocation(page),
+      interventionRequired: abnormalState !== undefined,
+      sendFailureVisible,
+      editorReadable: state !== undefined,
+      ...state,
+    }),
+  )
+
+  if (
+    beforeEnter &&
+    state?.textMatchesExpected &&
+    (state.childElementCount > beforeEnter.childElementCount ||
+      state.brCount > beforeEnter.brCount ||
+      state.pCount > beforeEnter.pCount ||
+      state.divCount > beforeEnter.divCount ||
+      state.lineBreakCount > beforeEnter.lineBreakCount)
+  ) {
+    logStep(accountName, targetName, '疑似 Enter 被编辑器解释为换行，而非发送')
+  }
+
+  return state
 }
 
 async function waitForEditorToMatchMessage(

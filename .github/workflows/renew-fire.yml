@@ -96,6 +96,17 @@ jobs:
           SPARK_MESSAGE_TEMPLATE: ${{ secrets.SPARK_MESSAGE_TEMPLATE }}
         run: bun src/main.ts
 
+      - name: 上传失败诊断 (Upload failure diagnostics)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: douyin-failure-diagnostics
+          path: |
+            artifacts/failure-screenshot-*.png
+            artifacts/failure-ui-*.json
+          if-no-files-found: warn
+          retention-days: 3
+
       - name: 检查邮件配置 (Check mail configuration)
         id: mail-config
         if: ${{ always() }}
