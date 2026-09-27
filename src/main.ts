@@ -197,7 +197,6 @@ async function runDouyinAccount(
           .first()
         await editorInput.waitFor({ state: 'visible', timeout: 10000 })
         await assertPageDoesNotRequireIntervention(page, account.name)
-        await editorInput.click()
         logStep(account.name, targetName, `${currentStep}完成`)
 
         let message: string
@@ -219,6 +218,8 @@ async function runDouyinAccount(
 
         currentStep = '输入并发送消息'
         logStep(account.name, targetName, currentStep, '开始输入消息（消息正文不写入日志）')
+        await editorInput.click()
+        await editorInput.focus()
         await page.keyboard.insertText(message)
         const editorContainsMessage = await waitForEditorToMatchMessage(page, editorInput, message)
 
@@ -473,22 +474,59 @@ async function waitForEditorToMatchMessage(
 ): Promise<boolean> {
   const deadline = Date.now() + EDITOR_INPUT_TIMEOUT
   const expectedText = normalizeComparableText(message)
+  let inputDiagnostics: Record<string, number | boolean | string | null> = {
+    expectedLength: expectedText.length,
+    editorReadable: false,
+  }
 
   while (Date.now() < deadline) {
-    const actualText = await editorInput.textContent().catch(() => undefined)
+    const editorState = await editorInput
+      .evaluate((element: HTMLElement) => ({
+        textContent: element.textContent ?? '',
+        innerText: element.innerText,
+        focused:
+          element === element.ownerDocument.activeElement ||
+          element.contains(element.ownerDocument.activeElement),
+        slateEditor: element.getAttribute('data-slate-editor'),
+        contentEditable: element.getAttribute('contenteditable'),
+      }))
+      .catch(() => undefined)
 
-    if (typeof actualText === 'string' && normalizeComparableText(actualText) === expectedText) {
-      return true
+    if (editorState) {
+      const normalizedTextContent = normalizeComparableText(editorState.textContent)
+      const normalizedInnerText = normalizeComparableText(editorState.innerText)
+
+      if (normalizedTextContent === expectedText || normalizedInnerText === expectedText) {
+        return true
+      }
+
+      inputDiagnostics = {
+        expectedLength: expectedText.length,
+        textContentLength: normalizedTextContent.length,
+        innerTextLength: normalizedInnerText.length,
+        focused: editorState.focused,
+        slateEditor: editorState.slateEditor,
+        contentEditable: editorState.contentEditable,
+        editorReadable: true,
+      }
+    } else {
+      inputDiagnostics.editorReadable = false
     }
 
     await page.waitForTimeout(100)
   }
 
+  console.warn(`输入确认超时（仅长度和编辑器状态）：${JSON.stringify(inputDiagnostics)}`)
   return false
 }
 
 function normalizeComparableText(value: string): string {
-  return value.replace(/\s+/g, ' ').trim()
+  return value
+    .replace(/(?:\u200B|\u200C|\u200D|\u2060|\uFEFF)/g, '')
+    .replace(/\u00A0/g, ' ')
+    .replace(/\r\n?/g, '\n')
+    .replace(/\s+/g, ' ')
+    .trim()
 }
 
 async function hasVisibleText(page: Page, pattern: RegExp): Promise<boolean> {
