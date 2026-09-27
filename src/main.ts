@@ -246,7 +246,9 @@ async function runDouyinAccount(
         logStep(account.name, targetName, '已确认发送消息')
       } catch (error) {
         const targetError = toError(error)
-        targetFailures.push(new Error(`[${targetName}] ${targetError.message}`, { cause: targetError }))
+        targetFailures.push(
+          new Error(`[${targetName}] ${targetError.message}`, { cause: targetError }),
+        )
         console.error(
           `[${account.name}] 联系人处理失败：${targetName}；步骤=${currentStep}；原因=${targetError.message}`,
         )
@@ -285,7 +287,9 @@ async function runDouyinAccount(
 
     logStep(account.name, undefined, '账号执行完成')
   } catch (error) {
-    console.error(`[${account.name}] 执行中止；步骤=${currentStep}；页面=${page ? safePageLocation(page) : '尚未打开'}`)
+    console.error(
+      `[${account.name}] 执行中止；步骤=${currentStep}；页面=${page ? safePageLocation(page) : '尚未打开'}`,
+    )
     await captureFailureDiagnostics(page, account, undefined, currentStep)
     throw error
   } finally {
@@ -393,10 +397,7 @@ async function detectLoginOrRiskState(
     return '页面地址异常'
   }
 
-  const candidates = await (searchVisible
-    ? page.locator(LOGIN_OR_RISK_SURFACE_SELECTOR)
-    : page
-  )
+  const candidates = await (searchVisible ? page.locator(LOGIN_OR_RISK_SURFACE_SELECTOR) : page)
     .getByText(LOGIN_OR_RISK_TEXT_PATTERN, { exact: true })
     .all()
 
@@ -431,7 +432,10 @@ async function waitForMessageSendConfirmation(
     const matchingMessageCount = await matchingMessages.count().catch(() => 0)
     const newMessageIsVisible =
       matchingMessageCount > matchingMessageCountBeforeSend &&
-      (await matchingMessages.last().isVisible().catch(() => false))
+      (await matchingMessages
+        .last()
+        .isVisible()
+        .catch(() => false))
     const sendFailureVisible = await hasVisibleSendFailureState(page)
     const now = Date.now()
 
@@ -667,19 +671,26 @@ async function captureFailureDiagnostics(
         .filter((element) => {
           const rect = element.getBoundingClientRect()
           const style = window.getComputedStyle(element)
-          return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none'
+          return (
+            rect.width > 0 &&
+            rect.height > 0 &&
+            style.visibility !== 'hidden' &&
+            style.display !== 'none'
+          )
         })
         .slice(0, 80)
         .map((element) => ({
           tag: element.tagName.toLowerCase(),
           role: element.getAttribute('role'),
           id: element.id || undefined,
-          className: typeof element.className === 'string' ? element.className.slice(0, 160) : undefined,
+          className:
+            typeof element.className === 'string' ? element.className.slice(0, 160) : undefined,
           ariaLabel: element.getAttribute('aria-label'),
           placeholder: element.getAttribute('placeholder'),
           title: element.getAttribute('title'),
           inputType: element.getAttribute('type'),
-          disabled: 'disabled' in element ? Boolean((element as HTMLInputElement).disabled) : undefined,
+          disabled:
+            'disabled' in element ? Boolean((element as HTMLInputElement).disabled) : undefined,
         }))
 
       return {
@@ -703,7 +714,9 @@ async function captureFailureDiagnostics(
     const serializedSummary = JSON.stringify(redactedSummary)
 
     await writeFile(dumpPath, `${JSON.stringify(redactedSummary, null, 2)}\n`, 'utf8')
-    console.error(`[${account.name}] 失败页面结构摘要（不含输入框值、消息正文或 Cookie）：${serializedSummary}`)
+    console.error(
+      `[${account.name}] 失败页面结构摘要（不含输入框值、消息正文或 Cookie）：${serializedSummary}`,
+    )
     console.error(`[${account.name}] 已保存页面结构摘要：${dumpPath}`)
   } catch (error) {
     console.error(`[${account.name}] 页面结构摘要采集失败：${toError(error).message}`)
@@ -724,7 +737,10 @@ function redactDiagnosticSummary<T>(value: T, namesToRedact: string[]): T {
 
   if (typeof value === 'object' && value !== null) {
     return Object.fromEntries(
-      Object.entries(value).map(([key, child]) => [key, redactDiagnosticSummary(child, namesToRedact)]),
+      Object.entries(value).map(([key, child]) => [
+        key,
+        redactDiagnosticSummary(child, namesToRedact),
+      ]),
     ) as T
   }
 
